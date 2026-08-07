@@ -85,19 +85,17 @@ impl OutboundRequest {
         Self {
             endpoint_id,
             socket,
-            state: InnerState {
-                id,
-                server_seq: 0,
-                client_seq: 0,
-                state: State::Initial,
-                encryption_done: true,
-                transfer_metadata: Some(TransferMetadata {
+            state: {
+                let mut state = InnerState::default();
+                state.id = id;
+                state.encryption_done = true;
+                state.transfer_metadata = Some(TransferMetadata {
                     id: String::from(""),
                     source: Some(rdi),
                     files: Some(files.to_owned()),
                     ..Default::default()
-                }),
-                ..Default::default()
+                });
+                state
             },
             sender,
             receiver,

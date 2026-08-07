@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -34,9 +35,10 @@ use crate::securemessage::{
     SecureMessage, SigScheme,
 };
 use crate::sharing_nearby::{paired_key_result_frame, text_metadata};
+use crate::hdl::info::TransferredFile;
 use crate::utils::{
-    encode_point, gen_ecdsa_keypair, gen_random, get_download_dir, hkdf_extract_expand,
-    stream_read_exact, to_four_digit_string, DeviceType, RemoteDeviceInfo,
+    encode_point, gen_ecdsa_keypair, gen_random, hkdf_extract_expand, stream_read_exact,
+    to_four_digit_string, DeviceType, RemoteDeviceInfo,
 };
 use crate::{location_nearby_connections, sharing_nearby};
 
@@ -51,24 +53,33 @@ pub struct InboundRequest {
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
+    download_dir: PathBuf,
+    consent_timeout: Duration,
+    consent_deadline: Option<tokio::time::Instant>,
 }
 
 impl InboundRequest {
-    pub fn new(socket: TcpStream, id: String, sender: Sender<ChannelMessage>) -> Self {
+    pub fn new(
+        socket: TcpStream,
+        id: String,
+        sender: Sender<ChannelMessage>,
+        download_dir: PathBuf,
+        consent_timeout: Duration,
+    ) -> Self {
         let receiver = sender.subscribe();
+
+        let mut state = InnerState::default();
+        state.id = id;
+        state.encryption_done = true;
 
         Self {
             socket,
-            state: InnerState {
-                id,
-                server_seq: 0,
-                client_seq: 0,
-                state: State::Initial,
-                encryption_done: true,
-                ..Default::default()
-            },
+            state,
             sender,
             receiver,
+            download_dir,
+            consent_timeout,
+            consent_deadline: None,
         }
     }
 
@@ -91,9 +102,11 @@ impl InboundRequest {
                         debug!("inbound: got: {:?}", channel_msg);
                         match channel_msg.action {
                             Some(ChannelAction::AcceptTransfer) => {
+                                self.consent_deadline = None;
                                 self.accept_transfer().await?;
                             },
                             Some(ChannelAction::RejectTransfer) => {
+                                self.consent_deadline = None;
                                 self.update_state(
                                     |e| {
                                         e.state = State::Rejected;
@@ -107,6 +120,7 @@ impl InboundRequest {
                                 return Err(anyhow!(crate::errors::AppError::NotAnError));
                             },
                             Some(ChannelAction::CancelTransfer) => {
+                                self.consent_deadline = None;
                                 self.update_state(
                                     |e| {
                                         e.state = State::Cancelled;
@@ -125,6 +139,27 @@ impl InboundRequest {
                         error!("inbound: channel error: {}", e);
                     }
                 }
+            },
+            _ = tokio::time::sleep_until(
+                self.consent_deadline
+                    .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86400))
+            ), if self.consent_deadline.is_some() => {
+                info!("inbound: consent timed out after {:?}", self.consent_timeout);
+                self.consent_deadline = None;
+                self.state.state = State::Rejected;
+                let _ = self.sender.send(ChannelMessage {
+                    id: self.state.id.clone(),
+                    direction: ChannelDirection::LibToFront,
+                    rtype: Some(crate::channel::TransferType::Inbound),
+                    state: Some(State::Rejected),
+                    meta: self.state.transfer_metadata.clone(),
+                    error: Some(crate::channel::TransferError::ConsentTimeout),
+                    ..Default::default()
+                });
+                self.reject_transfer(Some(
+                    sharing_nearby::connection_response_frame::Status::TimedOut
+                )).await?;
+                return Err(anyhow!(crate::errors::AppError::NotAnError));
             },
             h = stream_read_exact(&mut self.socket, &mut length_buf) => {
                 h?;
@@ -663,12 +698,33 @@ impl InboundRequest {
                                 |e| {
                                     if let Some(tmd) = e.transfer_metadata.as_mut() {
                                         tmd.ack_bytes += chunk_size as u64;
+                                        if let Some(fi) = tmd
+                                            .file_infos
+                                            .as_mut()
+                                            .and_then(|infos| {
+                                                infos.iter_mut().find(|f| f.payload_id == payload_id)
+                                            })
+                                        {
+                                            fi.bytes_transferred += chunk_size as u64;
+                                        }
                                     }
                                 },
                                 true,
                             )
                             .await;
                         } else if (chunk.flags() & 1) == 1 {
+                            if let Some(fi) = self
+                                .state
+                                .transfer_metadata
+                                .as_mut()
+                                .and_then(|tmd| tmd.file_infos.as_mut())
+                                .and_then(|infos| {
+                                    infos.iter_mut().find(|f| f.payload_id == payload_id)
+                                })
+                            {
+                                fi.completed = true;
+                                fi.bytes_transferred = fi.size;
+                            }
                             self.state.transferred_files.remove(&payload_id);
                             if self.state.transferred_files.is_empty() {
                                 info!("Transfer finished");
@@ -819,16 +875,19 @@ impl InboundRequest {
             false,
         )
         .await;
+        self.consent_deadline = Some(tokio::time::Instant::now() + self.consent_timeout);
 
         if !introduction.file_metadata.is_empty() && introduction.text_metadata.is_empty() {
             trace!("process_introduction: handling file_metadata");
+            std::fs::create_dir_all(&self.download_dir)?;
             let mut files_name = Vec::with_capacity(introduction.file_metadata.len());
+            let mut file_infos = Vec::with_capacity(introduction.file_metadata.len());
             let mut total_bytes: u64 = 0;
 
             for file in &introduction.file_metadata {
                 info!("File name: {}", file.name());
 
-                let mut dest = get_download_dir();
+                let mut dest = self.download_dir.clone();
                 dest.push(file.name());
 
                 info!("Destination: {:?}", dest);
@@ -856,6 +915,14 @@ impl InboundRequest {
                     file: None,
                 };
                 total_bytes += info.total_size as u64;
+                file_infos.push(TransferredFile {
+                    payload_id: file.payload_id(),
+                    name: file.name().to_owned(),
+                    size: file.size() as u64,
+                    bytes_transferred: 0,
+                    path: info.file_url.to_string_lossy().into_owned(),
+                    completed: false,
+                });
                 self.state.transferred_files.insert(file.payload_id(), info);
                 files_name.push(file.name().to_owned());
             }
@@ -863,7 +930,8 @@ impl InboundRequest {
             let metadata = TransferMetadata {
                 id: self.state.id.clone(),
                 destination: Some(
-                    get_download_dir()
+                    self.download_dir
+                        .clone()
                         .into_os_string()
                         .into_string()
                         .map_err(|_| anyhow!("failed to convert PathBuf to String"))?,
@@ -873,6 +941,7 @@ impl InboundRequest {
                 pin_code: self.state.pin_code.clone(),
                 text_description: None,
                 total_bytes,
+                file_infos: Some(file_infos),
                 ..Default::default()
             };
 

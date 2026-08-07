@@ -26,21 +26,42 @@ pub struct TcpServer {
     tcp_listener: TcpListener,
     sender: Sender<ChannelMessage>,
     connect_receiver: Receiver<SendInfo>,
+    download_dir: std::path::PathBuf,
+    session_subdirs: bool,
+    consent_timeout: std::time::Duration,
 }
 
 impl TcpServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         endpoint_id: [u8; 4],
         tcp_listener: TcpListener,
         sender: Sender<ChannelMessage>,
         connect_receiver: Receiver<SendInfo>,
+        download_dir: std::path::PathBuf,
+        session_subdirs: bool,
+        consent_timeout: std::time::Duration,
     ) -> Result<Self, anyhow::Error> {
         Ok(Self {
             endpoint_id,
             tcp_listener,
             sender,
             connect_receiver,
+            download_dir,
+            session_subdirs,
+            consent_timeout,
         })
+    }
+
+    /// Classify a session failure for the channel's `error` field.
+    fn classify(e: &anyhow::Error) -> crate::channel::TransferError {
+        if e.downcast_ref::<std::io::Error>().is_some() {
+            crate::channel::TransferError::Io
+        } else if e.downcast_ref::<prost::DecodeError>().is_some() {
+            crate::channel::TransferError::Decode
+        } else {
+            crate::channel::TransferError::Other
+        }
     }
 
     pub async fn run(&mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
@@ -66,9 +87,23 @@ impl TcpServer {
                             trace!("{INNER_NAME}: new client: {remote_addr}");
                             let esender = self.sender.clone();
                             let csender = self.sender.clone();
+                            let download_dir = if self.session_subdirs {
+                                // ip:port → filesystem-safe per-session dir
+                                let session = remote_addr.to_string().replace([':', '%', '/'], "-");
+                                self.download_dir.join(session)
+                            } else {
+                                self.download_dir.clone()
+                            };
+                            let consent_timeout = self.consent_timeout;
 
                             tokio::spawn(async move {
-                                let mut ir = InboundRequest::new(socket, remote_addr.to_string(), csender);
+                                let mut ir = InboundRequest::new(
+                                    socket,
+                                    remote_addr.to_string(),
+                                    csender,
+                                    download_dir,
+                                    consent_timeout,
+                                );
 
                                 loop {
                                     match ir.handle().await {
@@ -85,6 +120,7 @@ impl TcpServer {
                                                         id: remote_addr.to_string(),
                                                         direction: ChannelDirection::LibToFront,
                                                         state: Some(State::Disconnected),
+                                                        error: Some(Self::classify(&e)),
                                                         ..Default::default()
                                                     });
                                                 }
@@ -150,6 +186,7 @@ impl TcpServer {
                                         id: si.addr,
                                         direction: ChannelDirection::LibToFront,
                                         state: Some(State::Disconnected),
+                                        error: Some(Self::classify(&e)),
                                         ..Default::default()
                                     });
                                 }

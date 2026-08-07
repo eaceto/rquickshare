@@ -16,6 +16,19 @@ pub struct InternalFileInfo {
     pub file: Option<File>,
 }
 
+/// Per-file transfer detail: sender's name, declared size, live progress
+/// and the destination path chosen at introduction time.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, TS)]
+#[ts(export)]
+pub struct TransferredFile {
+    pub payload_id: i64,
+    pub name: String,
+    pub size: u64,
+    pub bytes_transferred: u64,
+    pub path: String,
+    pub completed: bool,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, TS)]
 #[ts(export)]
 pub struct TransferMetadata {
@@ -32,4 +45,7 @@ pub struct TransferMetadata {
 
     pub total_bytes: u64,
     pub ack_bytes: u64,
+
+    /// Per-file details (inbound file transfers only).
+    pub file_infos: Option<Vec<TransferredFile>>,
 }

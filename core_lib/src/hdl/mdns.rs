@@ -43,16 +43,19 @@ pub struct MDnsServer {
 }
 
 impl MDnsServer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         endpoint_id: [u8; 4],
         service_port: u16,
         device_name: Option<String>,
+        device_type: DeviceType,
+        ipv6: bool,
         ble_receiver: Receiver<()>,
         visibility_sender: Arc<Mutex<watch::Sender<Visibility>>>,
         visibility_receiver: watch::Receiver<Visibility>,
     ) -> Result<Self, anyhow::Error> {
         let service_info =
-            Self::build_service(endpoint_id, service_port, device_name, DeviceType::Laptop)?;
+            Self::build_service(endpoint_id, service_port, device_name, device_type, ipv6)?;
 
         Ok(Self {
             daemon: ServiceDaemon::new()?,
@@ -149,23 +152,30 @@ impl MDnsServer {
         service_port: u16,
         device_name: Option<String>,
         device_type: DeviceType,
+        ipv6: bool,
     ) -> Result<ServiceInfo, anyhow::Error> {
         let name = gen_mdns_name(endpoint_id);
-        let hostname = sys_metrics::host::get_hostname()?;
-        let display_name = device_name.unwrap_or_else(|| hostname.clone());
+        let display_name = match device_name {
+            Some(name) => name,
+            None => sys_metrics::host::get_hostname()?,
+        };
         info!("Broadcasting with: {display_name}");
         let endpoint_info = gen_mdns_endpoint_info(device_type as u8, &display_name);
+
+        // Synthetic SRV hostname: the real machine hostname is not the
+        // discovery identity and does not need to be broadcast to the LAN.
+        let mdns_host = format!("{}.local.", hex::encode(endpoint_id));
 
         let properties = [("n", endpoint_info)];
         let si = ServiceInfo::new(
             "_FC9F5ED42C8A._tcp.local.",
             &name,
-            &hostname,
+            &mdns_host,
             "",
             service_port,
             &properties[..],
         )?
-        .enable_addr_auto(AddrType::V4);
+        .enable_addr_auto(if ipv6 { AddrType::BOTH } else { AddrType::V4 });
 
         Ok(si)
     }

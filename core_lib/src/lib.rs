@@ -69,6 +69,16 @@ pub struct RQS {
 
     // Name advertised to nearby devices; system hostname when None
     device_name: Option<String>,
+    // Icon shown in the phone's share sheet
+    device_type: utils::DeviceType,
+    // Per-instance download dir (falls back to the global/default when None)
+    download_dir: Option<PathBuf>,
+    // Place each session's files in their own subdirectory of the download dir
+    session_subdirs: bool,
+    // Auto-reject a transfer if the user has not answered within this window
+    consent_timeout: std::time::Duration,
+    // Also publish AAAA records (some networks misbehave; default off)
+    ipv6: bool,
 
     pub message_sender: broadcast::Sender<ChannelMessage>,
 }
@@ -85,6 +95,7 @@ impl RQS {
         port_number: Option<u32>,
         download_path: Option<PathBuf>,
     ) -> Self {
+        let download_path_copy = download_path.clone();
         let mut guard = CUSTOM_DOWNLOAD.write().unwrap();
         *guard = download_path;
 
@@ -104,6 +115,11 @@ impl RQS {
             ble_sender,
             port_number,
             device_name: None,
+            device_type: utils::DeviceType::Laptop,
+            download_dir: download_path_copy,
+            session_subdirs: false,
+            consent_timeout: std::time::Duration::from_secs(60),
+            ipv6: false,
             message_sender,
         }
     }
@@ -112,6 +128,34 @@ impl RQS {
     /// hostname when unset). Call before `run()`.
     pub fn with_device_name(mut self, device_name: String) -> Self {
         self.device_name = Some(device_name);
+        self
+    }
+
+    /// Set the device-type icon shown in the phone's share sheet
+    /// (default: Laptop). Call before `run()`.
+    pub fn with_device_type(mut self, device_type: utils::DeviceType) -> Self {
+        self.device_type = device_type;
+        self
+    }
+
+    /// Give every transfer session its own subdirectory of the download
+    /// directory (default: off). Call before `run()`.
+    pub fn with_session_subdirs(mut self, enabled: bool) -> Self {
+        self.session_subdirs = enabled;
+        self
+    }
+
+    /// Auto-reject transfers the user has not answered within `timeout`
+    /// (default: 60 seconds). Call before `run()`.
+    pub fn with_consent_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.consent_timeout = timeout;
+        self
+    }
+
+    /// Also publish IPv6 (AAAA) address records (default: off).
+    /// Call before `run()`.
+    pub fn with_ipv6(mut self, enabled: bool) -> Self {
+        self.ipv6 = enabled;
         self
     }
 
@@ -141,6 +185,11 @@ impl RQS {
             tcp_listener,
             self.message_sender.clone(),
             send_channel.1,
+            self.download_dir
+                .clone()
+                .unwrap_or_else(crate::utils::get_download_dir),
+            self.session_subdirs,
+            self.consent_timeout,
         )?;
         let ctk = ctoken.clone();
         tracker.spawn(async move { server.run(ctk).await });
@@ -159,6 +208,8 @@ impl RQS {
             endpoint_id[..4].try_into()?,
             binded_addr.port(),
             self.device_name.clone(),
+            self.device_type,
+            self.ipv6,
             self.ble_sender.subscribe(),
             self.visibility_sender.clone(),
             self.visibility_receiver.clone(),
@@ -236,7 +287,9 @@ impl RQS {
         self.tracker = None;
     }
 
-    // Setting None here will resume the default settings
+    // Setting None here will resume the default settings.
+    // Note: affects the *global* fallback; sessions of an already-running
+    // instance keep the directory captured at `run()`.
     pub fn set_download_path(&self, p: Option<PathBuf>) {
         debug!("Setting the download path to {:?}", p);
         let mut guard = CUSTOM_DOWNLOAD.write().unwrap();
