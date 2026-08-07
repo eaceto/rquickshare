@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use p256::{PublicKey, SecretKey};
+use zeroize::Zeroize;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -83,6 +84,24 @@ pub struct InnerState {
     // pub text_is_url: bool,
     // pub wifi_ssid: Option<String>,
     pub payload_buffers: HashMap<i64, Vec<u8>>,
+}
+
+impl Drop for InnerState {
+    fn drop(&mut self) {
+        // Session keys are one-shot; wipe them when the session ends.
+        // (p256::SecretKey already zeroizes itself on drop.)
+        for key in [
+            &mut self.decrypt_key,
+            &mut self.recv_hmac_key,
+            &mut self.encrypt_key,
+            &mut self.send_hmac_key,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            key.zeroize();
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

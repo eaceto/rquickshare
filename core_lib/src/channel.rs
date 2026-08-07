@@ -20,6 +20,16 @@ pub enum ChannelAction {
     CancelTransfer,
 }
 
+/// Coarse failure classification for terminal states.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, TS)]
+#[ts(export)]
+pub enum TransferError {
+    Io,
+    Decode,
+    ConsentTimeout,
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, TS)]
 #[ts(export)]
 pub enum TransferType {
@@ -40,4 +50,6 @@ pub struct ChannelMessage {
     pub rtype: Option<TransferType>,
     pub state: Option<State>,
     pub meta: Option<TransferMetadata>,
+    // Only present on terminal states caused by a failure
+    pub error: Option<TransferError>,
 }

@@ -19,7 +19,7 @@ use ts_rs::TS;
 
 use crate::CUSTOM_DOWNLOAD;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Serialize, TS)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Serialize, TS)]
 #[ts(export)]
 #[allow(dead_code)]
 pub enum DeviceType {
