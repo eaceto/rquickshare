@@ -67,6 +67,9 @@ pub struct RQS {
 
     port_number: Option<u32>,
 
+    // Name advertised to nearby devices; system hostname when None
+    device_name: Option<String>,
+
     pub message_sender: broadcast::Sender<ChannelMessage>,
 }
 
@@ -100,8 +103,16 @@ impl RQS {
             visibility_receiver,
             ble_sender,
             port_number,
+            device_name: None,
             message_sender,
         }
+    }
+
+    /// Set the name advertised to nearby devices (defaults to the system
+    /// hostname when unset). Call before `run()`.
+    pub fn with_device_name(mut self, device_name: String) -> Self {
+        self.device_name = Some(device_name);
+        self
     }
 
     pub async fn run(
@@ -147,6 +158,7 @@ impl RQS {
         let mut mdns = MDnsServer::new(
             endpoint_id[..4].try_into()?,
             binded_addr.port(),
+            self.device_name.clone(),
             self.ble_sender.subscribe(),
             self.visibility_sender.clone(),
             self.visibility_receiver.clone(),

@@ -46,11 +46,13 @@ impl MDnsServer {
     pub fn new(
         endpoint_id: [u8; 4],
         service_port: u16,
+        device_name: Option<String>,
         ble_receiver: Receiver<()>,
         visibility_sender: Arc<Mutex<watch::Sender<Visibility>>>,
         visibility_receiver: watch::Receiver<Visibility>,
     ) -> Result<Self, anyhow::Error> {
-        let service_info = Self::build_service(endpoint_id, service_port, DeviceType::Laptop)?;
+        let service_info =
+            Self::build_service(endpoint_id, service_port, device_name, DeviceType::Laptop)?;
 
         Ok(Self {
             daemon: ServiceDaemon::new()?,
@@ -66,6 +68,7 @@ impl MDnsServer {
         let monitor = self.daemon.monitor()?;
         let ble_receiver = &mut self.ble_receiver;
         let mut visibility = *self.visibility_receiver.borrow();
+        let mut registered = false;
         let mut interval = interval_at(Instant::now() + TICK_INTERVAL, TICK_INTERVAL);
 
         loop {
@@ -86,11 +89,16 @@ impl MDnsServer {
                     debug!("{INNER_NAME}: visibility changed: {visibility:?}");
                     if visibility == Visibility::Visible {
                         self.daemon.register(self.service_info.clone())?;
+                        registered = true;
                     } else if visibility == Visibility::Invisible {
-                        let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
-                        let _ = receiver.recv();
+                        if registered {
+                            let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
+                            let _ = receiver.recv();
+                            registered = false;
+                        }
                     } else if visibility == Visibility::Temporarily {
                         self.daemon.register(self.service_info.clone())?;
+                        registered = true;
                         interval.reset();
                     }
                 }
@@ -100,13 +108,14 @@ impl MDnsServer {
                     }
 
                     debug!("{INNER_NAME}: ble_receiver: got event");
-                    if visibility == Visibility::Visible || visibility == Visibility::Temporarily {
+                    if registered {
                         // Android can sometime not see the mDNS service if the service
                         // was running BEFORE Android started the Discovery phase for QuickShare.
                         // So resend a broadcast if there's a android device sending.
                         self.daemon.register_resend(self.service_info.get_fullname())?;
                     } else {
                         self.daemon.register(self.service_info.clone())?;
+                        registered = true;
                     }
                 },
                 _ = interval.tick() => {
@@ -114,17 +123,22 @@ impl MDnsServer {
                         continue;
                     }
 
-                    let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
-                    let _ = receiver.recv();
+                    if registered {
+                        let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
+                        let _ = receiver.recv();
+                        registered = false;
+                    }
                     let _ = self.visibility_sender.lock().unwrap().send(Visibility::Invisible);
                 }
             }
         }
 
         // Unregister the mDNS service - we're shutting down
-        let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
-        if let Ok(event) = receiver.recv() {
-            info!("MDnsServer: service unregistered: {:?}", &event);
+        if registered {
+            let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
+            if let Ok(event) = receiver.recv() {
+                info!("MDnsServer: service unregistered: {:?}", &event);
+            }
         }
 
         Ok(())
@@ -133,12 +147,14 @@ impl MDnsServer {
     fn build_service(
         endpoint_id: [u8; 4],
         service_port: u16,
+        device_name: Option<String>,
         device_type: DeviceType,
     ) -> Result<ServiceInfo, anyhow::Error> {
         let name = gen_mdns_name(endpoint_id);
         let hostname = sys_metrics::host::get_hostname()?;
-        info!("Broadcasting with: {hostname}");
-        let endpoint_info = gen_mdns_endpoint_info(device_type as u8, &hostname);
+        let display_name = device_name.unwrap_or_else(|| hostname.clone());
+        info!("Broadcasting with: {display_name}");
+        let endpoint_info = gen_mdns_endpoint_info(device_type as u8, &display_name);
 
         let properties = [("n", endpoint_info)];
         let si = ServiceInfo::new(

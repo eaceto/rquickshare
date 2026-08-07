@@ -700,7 +700,7 @@ impl InboundRequest {
                 self.send_keepalive(true).await?;
             }
             _ => {
-                error!("Unhandled offline frame encrypted: {:?}", offline);
+                debug!("Unhandled offline frame encrypted: {:?}", offline);
             }
         }
 
