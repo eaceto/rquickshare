@@ -22,7 +22,7 @@ use tokio::sync::broadcast::{Receiver, Sender};
 use ts_rs::TS;
 
 use super::info::{InternalFileInfo, TransferMetadata};
-use super::{InnerState, State};
+use super::{InnerState, State, TextPayloadType};
 use crate::channel::{ChannelAction, ChannelDirection, ChannelMessage};
 use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium;
 use crate::location_nearby_connections::connection_response_frame::ResponseStatus;
@@ -41,7 +41,8 @@ use crate::securemessage::{
     SecureMessage, SigScheme,
 };
 use crate::sharing_nearby::{
-    file_metadata, paired_key_result_frame, FileMetadata, IntroductionFrame,
+    file_metadata, paired_key_result_frame, text_metadata, FileMetadata, IntroductionFrame,
+    TextMetadata,
 };
 use crate::utils::{
     encode_point, gen_ecdsa_keypair, gen_random, hkdf_extract_expand, stream_read_exact,
@@ -54,10 +55,42 @@ type HmacSha256 = Hmac<Sha256>;
 const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
 const SANITY_DURATION: Duration = Duration::from_micros(10);
 
+/// What a text attachment is, which decides how the receiver offers to
+/// act on it: open a browser, a map, or the dialer. Mirrors the protocol's
+/// TextMetadata.Type.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, TS, PartialEq)]
+#[ts(export)]
+pub enum OutboundTextType {
+    #[default]
+    Text,
+    Url,
+    Address,
+    PhoneNumber,
+}
+
+impl OutboundTextType {
+    fn as_metadata_type(&self) -> text_metadata::Type {
+        match self {
+            OutboundTextType::Text => text_metadata::Type::Text,
+            OutboundTextType::Url => text_metadata::Type::Url,
+            OutboundTextType::Address => text_metadata::Type::Address,
+            OutboundTextType::PhoneNumber => text_metadata::Type::PhoneNumber,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, TS)]
 #[ts(export)]
 pub enum OutboundPayload {
     Files(Vec<String>),
+    /// A single text attachment. `description` is the title the receiving
+    /// device shows while asking whether to accept; `content` is the text
+    /// itself, sent only once the peer agrees.
+    Text {
+        kind: OutboundTextType,
+        description: String,
+        content: String,
+    },
 }
 
 #[derive(Debug)]
@@ -68,6 +101,9 @@ pub struct OutboundRequest {
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
     payload: OutboundPayload,
+    /// Text announced in the introduction, held until consent arrives: the
+    /// payload id the peer was told to expect, and the bytes to send under it.
+    text_to_send: Option<(i64, Vec<u8>)>,
 }
 
 impl OutboundRequest {
@@ -80,7 +116,31 @@ impl OutboundRequest {
         rdi: RemoteDeviceInfo,
     ) -> Self {
         let receiver = sender.subscribe();
-        let OutboundPayload::Files(files) = &payload;
+        // Describe the transfer to the UI up front, before anything is sent,
+        // so progress can be shown for either kind of payload.
+        let metadata = match &payload {
+            OutboundPayload::Files(files) => TransferMetadata {
+                id: String::from(""),
+                source: Some(rdi),
+                files: Some(files.to_owned()),
+                ..Default::default()
+            },
+            OutboundPayload::Text {
+                kind,
+                description,
+                content,
+            } => TransferMetadata {
+                id: String::from(""),
+                source: Some(rdi),
+                text_type: Some(match kind {
+                    OutboundTextType::Url => TextPayloadType::Url,
+                    _ => TextPayloadType::Text,
+                }),
+                text_description: Some(description.to_owned()),
+                text_payload: Some(content.to_owned()),
+                ..Default::default()
+            },
+        };
 
         Self {
             endpoint_id,
@@ -89,17 +149,13 @@ impl OutboundRequest {
                 let mut state = InnerState::default();
                 state.id = id;
                 state.encryption_done = true;
-                state.transfer_metadata = Some(TransferMetadata {
-                    id: String::from(""),
-                    source: Some(rdi),
-                    files: Some(files.to_owned()),
-                    ..Default::default()
-                });
+                state.transfer_metadata = Some(metadata);
                 state
             },
             sender,
             receiver,
             payload,
+            text_to_send: None,
         }
     }
 
@@ -629,9 +685,9 @@ impl OutboundRequest {
         }
 
         let mut file_metadata: Vec<FileMetadata> = vec![];
+        let mut text_metadata: Vec<TextMetadata> = vec![];
         let mut transferred_files: HashMap<i64, InternalFileInfo> = HashMap::new();
         let mut total_to_send = 0;
-        // TODO - Handle sending Text
         match &self.payload {
             OutboundPayload::Files(files) => {
                 for f in files {
@@ -698,6 +754,26 @@ impl OutboundRequest {
                     total_to_send += fmetadata.size();
                 }
             }
+            OutboundPayload::Text {
+                kind,
+                description,
+                content,
+            } => {
+                let body = content.as_bytes().to_vec();
+                // The peer matches this id against the Bytes payload that
+                // follows, so the same value must be used in both places.
+                let payload_id = rand::rng().random::<i64>();
+
+                total_to_send = body.len() as u64;
+                text_metadata.push(TextMetadata {
+                    id: Some(rand::rng().random::<i64>()),
+                    payload_id: Some(payload_id),
+                    text_title: Some(description.to_owned()),
+                    r#type: Some(kind.as_metadata_type().into()),
+                    size: Some(body.len() as i64),
+                });
+                self.text_to_send = Some((payload_id, body));
+            }
         }
 
         self.update_state(
@@ -717,6 +793,7 @@ impl OutboundRequest {
                 r#type: Some(sharing_nearby::v1_frame::FrameType::Introduction.into()),
                 introduction: Some(IntroductionFrame {
                     file_metadata,
+                    text_metadata,
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -749,7 +826,26 @@ impl OutboundRequest {
                 )
                 .await;
 
-                // TODO - Handle sending Text
+                // Text is a single payload with nothing to stream, so it is
+                // sent and finished here rather than going through the loop.
+                if let Some((payload_id, body)) = self.text_to_send.take() {
+                    let sent = body.len() as u64;
+                    info!("Sending text payload {payload_id} ({sent} bytes)");
+                    self.send_bytes_payload(payload_id, body).await?;
+                    self.update_state(
+                        |e| {
+                            e.state = State::Finished;
+                            if let Some(tmd) = e.transfer_metadata.as_mut() {
+                                tmd.ack_bytes = sent;
+                            }
+                        },
+                        true,
+                    )
+                    .await;
+                    self.disconnection().await?;
+                    return Ok(());
+                }
+
                 let ids: Vec<i64> = self.state.transferred_files.keys().cloned().collect();
                 info!("We are sending: {:?}", ids);
                 let mut ids_iter = ids.into_iter();
@@ -1055,11 +1151,23 @@ impl OutboundRequest {
         &mut self,
         frame: &sharing_nearby::Frame,
     ) -> Result<(), anyhow::Error> {
-        let frame_data = frame.encode_to_vec();
+        let id = rand::rng().random_range(i64::MIN..i64::MAX);
+        self.send_bytes_payload(id, frame.encode_to_vec()).await
+    }
+
+    /// Send a whole Bytes payload: one chunk carrying the body, then the
+    /// empty chunk that marks the end. Control frames get a throwaway id;
+    /// a text attachment must reuse the id announced in the introduction,
+    /// which is how the peer knows which attachment just arrived.
+    async fn send_bytes_payload(
+        &mut self,
+        id: i64,
+        frame_data: Vec<u8>,
+    ) -> Result<(), anyhow::Error> {
         let body_size = frame_data.len();
 
         let payload_header = PayloadHeader {
-            id: Some(rand::rng().random_range(i64::MIN..i64::MAX)),
+            id: Some(id),
             r#type: Some(payload_header::PayloadType::Bytes.into()),
             total_size: Some(body_size as i64),
             is_sensitive: Some(false),
