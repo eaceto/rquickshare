@@ -52,7 +52,7 @@ pub struct RemoteDeviceInfo {
 impl RemoteDeviceInfo {
     pub fn serialize(&self) -> Vec<u8> {
         // 1 byte: Version(3 bits)|Visibility(1 bit)|Device Type(3 bits)|Reserved(1 bit)
-        let mut endpoint_info: Vec<u8> = vec![((self.device_type.clone() as u8) << 1) & 0b111];
+        let mut endpoint_info: Vec<u8> = vec![((self.device_type as u8) << 1) & 0b111];
 
         // 16 bytes: unknown random bytes
         endpoint_info.extend((0..16).map(|_| rand::rng().random_range(0..=255)));

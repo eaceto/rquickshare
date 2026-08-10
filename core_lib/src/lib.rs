@@ -169,11 +169,7 @@ impl RQS {
         self.tracker = Some(tracker.clone());
         self.ctoken = Some(ctoken.clone());
 
-        let endpoint_id: Vec<u8> = rand::rng()
-            .sample_iter(Alphanumeric)
-            .take(4)
-            .map(u8::from)
-            .collect();
+        let endpoint_id: Vec<u8> = rand::rng().sample_iter(Alphanumeric).take(4).collect();
         let tcp_listener =
             TcpListener::bind(format!("0.0.0.0:{}", self.port_number.unwrap_or(0))).await?;
         let binded_addr = tcp_listener.local_addr()?;
