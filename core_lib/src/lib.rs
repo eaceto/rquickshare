@@ -230,6 +230,14 @@ impl RQS {
             .ok_or_else(|| anyhow!("The service wasn't first started"))?;
 
         let ctk = CancellationToken::new();
+
+        // Built before anything is spawned: this is the only fallible step,
+        // and starting the BLE advertiser first meant a failure here returned
+        // an error while leaving an advertisement registered with BlueZ that
+        // nothing would ever cancel. Each retry then burned another of the
+        // adapter's advertising slots.
+        let discovery = MDnsDiscovery::new(sender)?;
+
         self.discovery_ctk = Some(ctk.clone());
 
         #[cfg(all(feature = "experimental", target_os = "linux"))]
@@ -250,7 +258,6 @@ impl RQS {
             });
         }
 
-        let discovery = MDnsDiscovery::new(sender)?;
         tracker.spawn(async move { discovery.run(ctk.clone()).await });
 
         Ok(())

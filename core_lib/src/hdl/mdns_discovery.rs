@@ -36,6 +36,12 @@ impl MDnsDiscovery {
 
     pub async fn run(self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         info!("MDnsDiscovery: service starting");
+        // `ServiceDaemon` is a handle to a thread that owns one socket per
+        // interface; it has no `Drop`, so dropping the handle leaves that
+        // thread running forever, holding its file descriptors and logging
+        // into the browse channel nobody is reading any more. Every path out
+        // of this function has to shut it down, including the `?` below.
+        let _guard = DaemonGuard(self.daemon.clone());
 
         let service_type = "_FC9F5ED42C8A._tcp.local.";
         let receiver = self.daemon.browse(service_type)?;
@@ -125,5 +131,19 @@ impl MDnsDiscovery {
         }
 
         Ok(())
+    }
+}
+
+/// Shuts the mDNS daemon down however `MDnsDiscovery::run` leaves: cancelled,
+/// returned early, or unwound by a panic.
+struct DaemonGuard(ServiceDaemon);
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        // The daemon may already be gone; there is nothing to do about it
+        // here either way.
+        if let Err(e) = self.0.shutdown() {
+            debug!("MDnsDiscovery: daemon shutdown: {}", e);
+        }
     }
 }
