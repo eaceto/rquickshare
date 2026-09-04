@@ -115,15 +115,22 @@ impl TcpServer {
                                                     break;
                                                 }
 
-                                                if ir.state.state != State::Finished {
-                                                    let _ = esender.send(ChannelMessage {
-                                                        id: remote_addr.to_string(),
-                                                        direction: ChannelDirection::LibToFront,
-                                                        state: Some(State::Disconnected),
-                                                        error: Some(Self::classify(&e)),
-                                                        ..Default::default()
-                                                    });
+                                                if ir.state.state == State::Finished {
+                                                    // The transfer completed and the peer
+                                                    // hung up: an eof here is the handshake
+                                                    // ending, not a failure. The front end
+                                                    // is told nothing for the same reason.
+                                                    debug!("{INNER_NAME}: client closed after finishing: {e}");
+                                                    break;
                                                 }
+
+                                                let _ = esender.send(ChannelMessage {
+                                                    id: remote_addr.to_string(),
+                                                    direction: ChannelDirection::LibToFront,
+                                                    state: Some(State::Disconnected),
+                                                    error: Some(Self::classify(&e)),
+                                                    ..Default::default()
+                                                });
                                                 error!("{INNER_NAME}: error while handling client: {e} ({:?})", ir.state.state);
                                                 break;
                                             }
@@ -181,15 +188,22 @@ impl TcpServer {
                                     break;
                                 }
 
-                                if or.state.state != State::Finished && or.state.state != State::Cancelled {
-                                    let _ = self.sender.clone().send(ChannelMessage {
-                                        id: si.addr,
-                                        direction: ChannelDirection::LibToFront,
-                                        state: Some(State::Disconnected),
-                                        error: Some(Self::classify(&e)),
-                                        ..Default::default()
-                                    });
+                                if or.state.state == State::Finished
+                                    || or.state.state == State::Cancelled
+                                {
+                                    // Same as inbound: the session reached its
+                                    // end before the socket did.
+                                    debug!("{INNER_NAME}: peer closed after {:?}: {e}", or.state.state);
+                                    break;
                                 }
+
+                                let _ = self.sender.clone().send(ChannelMessage {
+                                    id: si.addr,
+                                    direction: ChannelDirection::LibToFront,
+                                    state: Some(State::Disconnected),
+                                    error: Some(Self::classify(&e)),
+                                    ..Default::default()
+                                });
                                 error!("{INNER_NAME}: error while handling client: {e} ({:?})", or.state.state);
                                 break;
                             }
